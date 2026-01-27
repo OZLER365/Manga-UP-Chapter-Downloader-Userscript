@@ -1,0 +1,292 @@
+
+
+    // ==UserScript==
+    // @name           Manga-UP Ripper (v13 Enhanced)
+    // @namespace      https://greasyfork.org/en/users/1553223-ozler365
+    // @version        13.1.0
+    // @description    Based on v13. Adds "Wait for Load" logic and smart Zip naming (Series - Chapter).
+    // @author         ozler365 (Modified)
+    // @license        MIT
+    // @match          https://global.manga-up.com/*
+    // @require        https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+    // @require        https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+    // @grant          none
+    // ==/UserScript==
+     
+    (function () {
+      'use strict';
+     
+      // --- Configuration ---
+      const CONFIG = {
+          IMG_SELECTOR: 'img[src^="blob:"]', // Look for blob images
+          SLIDE_TIME: 1000,                  // Time for the slide animation to finish
+          MAX_WAIT_LOAD: 8000                // Max time to wait for a spinning loader (8s)
+      };
+     
+      // --- State ---
+      const state = {
+          captured: new Map(),
+          isRunning: false
+      };
+     
+      // --- Styles ---
+      const injectStyles = () => {
+        const style = document.createElement('style');
+        style.textContent = `
+          #mangaup-ui {
+            position: fixed; bottom: 20px; right: 20px; z-index: 999999;
+            font-family: sans-serif; display: flex; flex-direction: column; gap: 5px;
+            align-items: flex-end;
+          }
+          #ripper-btn {
+            padding: 10px 20px;
+            background: #0d3594; color: white; border: none; border-radius: 6px;
+            font-weight: bold; cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            font-size: 14px;
+          }
+          #ripper-btn:hover { background: #082260; }
+          #ripper-btn.waiting { background: #f0ad4e; }
+          #ripper-status {
+            background: rgba(0,0,0,0.85); color: #fff; padding: 8px 12px;
+            border-radius: 4px; font-size: 12px;
+            white-space: nowrap; display: none;
+          }
+        `;
+        document.head.appendChild(style);
+      };
+     
+      // --- 1. Smart Naming Logic (Series + Chapter) ---
+      function getFilename() {
+          const clean = (str) => str.replace(/[\\/:*?"<>|]+/g, ' ').trim();
+          
+          // A. Get Series Name (from Metadata)
+          let series = "";
+          const metaTitle = document.querySelector('meta[property="og:title"]');
+          if (metaTitle) {
+              series = metaTitle.content.split('|')[0].trim();
+          } else {
+              series = document.title.split('|')[0].trim();
+          }
+     
+          // B. Get Chapter Number (Scraping visible text)
+          let chapter = "Chapter";
+          // Scan headers for "Chapter X"
+          const candidates = document.querySelectorAll('div, span, h1, h2');
+          for (const el of candidates) {
+              const txt = el.innerText ? el.innerText.trim() : "";
+              // Looks for "Chapter 1" or "Chapter 1-2"
+              if (/^(Chapter|Ep)\s+[\d.-]+/.test(txt) && txt.length < 50) {
+                  const rect = el.getBoundingClientRect();
+                  if (rect.top < 200) { // Must be at top of screen
+                      chapter = txt;
+                      break;
+                  }
+              }
+          }
+     
+          // Fallback if scraping failed
+          if (chapter === "Chapter") {
+              const match = document.title.match(/(Chapter\s*[\d.-]+)/i);
+              if (match) chapter = match[1];
+          }
+     
+          // Combine (Avoid "Series Chapter 1 - Chapter 1")
+          if (series.includes(chapter)) return `${clean(series)}.zip`;
+          return `${clean(series)} - ${clean(chapter)}.zip`;
+      }
+     
+      // --- 2. Progress & Capture ---
+      
+      function getProgress() {
+          const allDivs = document.querySelectorAll('div, span, p');
+          for (const el of allDivs) {
+              if (el.offsetParent === null) continue;
+              const text = el.innerText.trim();
+              const match = text.match(/^(\d+)\s*\/\s*(\d+)$/);
+              if (match) {
+                  return {
+                      current: parseInt(match[1], 10),
+                      total: parseInt(match[2], 10)
+                  };
+              }
+          }
+          return null;
+      }
+     
+      function copyImageToBlob(img) {
+          return new Promise((resolve) => {
+              // Verify image is actually loaded
+              if (!img.complete || img.naturalWidth < 50) {
+                  resolve(null);
+                  return;
+              }
+              try {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = img.naturalWidth;
+                  canvas.height = img.naturalHeight;
+                  const ctx = canvas.getContext('2d');
+                  ctx.drawImage(img, 0, 0);
+                  canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.95);
+              } catch (e) {
+                  resolve(null);
+              }
+          });
+      }
+     
+      async function scanPages() {
+          const images = document.querySelectorAll(CONFIG.IMG_SELECTOR);
+          let newCount = 0;
+          
+          for (const img of images) {
+              if (img.naturalWidth < 200) continue; // Skip icons
+              const id = img.src;
+              
+              if (!state.captured.has(id)) {
+                  const blob = await copyImageToBlob(img);
+                  if (blob) {
+                      // Save logic
+                      let pageNum = state.captured.size + 1;
+                      // Try to get explicit page number from ALT
+                      const m = (img.alt || "").match(/page_(\d+)/);
+                      if (m) pageNum = parseInt(m[1], 10);
+                      
+                      state.captured.set(id, { blob, pageNum });
+                      newCount++;
+                  }
+              }
+          }
+          return newCount;
+      }
+     
+      function triggerNext() {
+          document.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'ArrowLeft', keyCode: 37, bubbles: true
+          }));
+      }
+     
+      // --- 3. Main Engine (v13 Modified) ---
+     
+      async function startEngine(btn, statusLabel) {
+          if (state.isRunning) {
+              state.isRunning = false;
+              btn.innerText = "Stopping...";
+              return;
+          }
+     
+          state.isRunning = true;
+          state.captured.clear();
+          btn.innerText = "Stop (Saving...)";
+          statusLabel.style.display = 'block';
+          
+          while (state.isRunning) {
+              // 1. Where are we?
+              const progress = getProgress();
+              
+              // 2. WAIT FOR LOAD (The new feature)
+              // We loop until we find a NEW image, or timeout
+              let waitTime = 0;
+              let foundNewImage = false;
+              
+              btn.classList.add('waiting'); // Visual cue: Yellow button = Waiting
+              
+              while (waitTime < CONFIG.MAX_WAIT_LOAD) {
+                  const count = await scanPages();
+                  if (count > 0) {
+                      foundNewImage = true;
+                      break; // Found it! Stop waiting.
+                  }
+                  // Wait 200ms and check again
+                  await new Promise(r => setTimeout(r, 200));
+                  waitTime += 200;
+              }
+              
+              btn.classList.remove('waiting'); // Back to Blue
+              
+              // 3. Update Status
+              const capturedCount = state.captured.size;
+              if (progress) {
+                  statusLabel.innerText = `Reading: ${progress.current} / ${progress.total} (Saved: ${capturedCount})`;
+                  
+                  // Stop Condition
+                  if (progress.current >= progress.total) {
+                      // Check one last time to ensure end-page capture
+                      await scanPages();
+                      break; 
+                  }
+              } else {
+                  statusLabel.innerText = `Scanning... (Saved: ${capturedCount})`;
+              }
+     
+              // 4. Navigate
+              triggerNext();
+              
+              // 5. Slide Delay
+              // We wait for the animation to finish so the next image enters the DOM
+              await new Promise(r => setTimeout(r, CONFIG.SLIDE_TIME));
+          }
+     
+          finish(btn, statusLabel);
+      }
+     
+      async function finish(btn, statusLabel) {
+          state.isRunning = false;
+          const pages = Array.from(state.captured.values());
+     
+          if (pages.length === 0) {
+              btn.innerText = "Start Rip";
+              statusLabel.innerText = "No pages saved.";
+              return;
+          }
+     
+          btn.innerText = "Zipping...";
+          statusLabel.innerText = "Generating ZIP...";
+     
+          // Sort
+          pages.sort((a, b) => a.pageNum - b.pageNum);
+     
+          const zip = new JSZip();
+          pages.forEach((p, i) => {
+              const name = `${String(i + 1).padStart(3, '0')}.jpg`;
+              zip.file(name, p.blob);
+          });
+     
+          // Name File
+          const filename = getFilename();
+          
+          try {
+              const content = await zip.generateAsync({ type: "blob" });
+              saveAs(content, filename);
+              statusLabel.innerText = "Done!";
+          } catch (e) {
+              statusLabel.innerText = "Error: " + e;
+          }
+     
+          setTimeout(() => {
+              btn.innerText = "Start Rip";
+              statusLabel.style.display = 'none';
+          }, 4000);
+      }
+     
+      // --- Init ---
+      function createUI() {
+          if (document.getElementById('mangaup-ui')) return;
+          const div = document.createElement('div');
+          div.id = 'mangaup-ui';
+          const status = document.createElement('div');
+          status.id = 'ripper-status';
+          const btn = document.createElement('button');
+          btn.id = 'ripper-btn';
+          btn.innerText = "Start Rip";
+          btn.onclick = () => startEngine(btn, status);
+          div.appendChild(status);
+          div.appendChild(btn);
+          document.body.appendChild(div);
+      }
+     
+      injectStyles();
+      setInterval(() => {
+          if (!document.getElementById('mangaup-ui')) createUI();
+      }, 1000);
+     
+    })();
+
