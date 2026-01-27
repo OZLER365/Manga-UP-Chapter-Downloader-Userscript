@@ -3,7 +3,7 @@
     // ==UserScript==
     // @name           Manga-UP Ripper
     // @namespace      https://greasyfork.org/en/users/1553223-ozler365
-    // @version        12.0.1
+    // @version        12.1.0
     // @description    Strictly syncs download progress with page navigation. WILL NOT slide until the current image is fully loaded.
     // @author         ozler365 (Modified)
     // @license        MIT
