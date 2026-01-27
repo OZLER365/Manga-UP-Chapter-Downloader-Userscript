@@ -1,0 +1,260 @@
+
+
+    // ==UserScript==
+    // @name           Manga-UP Ripper
+    // @namespace      https://greasyfork.org/en/users/1553223-ozler365
+    // @version        11.0.0
+    // @description    Specialized for Manga-UP's horizontal slider. Captures page_X alt tags for perfect ordering.
+    // @author         ozler365 (Modified)
+    // @license        MIT
+    // @match          https://global.manga-up.com/*
+    // @require        https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+    // @require        https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js
+    // @grant          none
+    // ==/UserScript==
+     
+    (function () {
+      'use strict';
+     
+      // --- Configuration ---
+      const CONFIG = {
+          IMG_SELECTOR: 'img.G54Y0W_page', // From your screenshot
+          WAIT_TIME: 1500,                 // Time to wait after turning a page
+          MAX_RETRIES: 8                   // How many times to try "Next" without finding new pages before stopping
+      };
+     
+      // --- State ---
+      const state = {
+          captured: new Map(), // Key: "page_1", Value: Blob
+          isRunning: false
+      };
+     
+      // --- Styles ---
+      const injectStyles = () => {
+        const style = document.createElement('style');
+        style.textContent = `
+          #mangaup-ui {
+            position: fixed; bottom: 20px; right: 20px; z-index: 999999;
+            font-family: sans-serif; display: flex; flex-direction: column; gap: 5px;
+          }
+          #ripper-btn {
+            padding: 12px 24px;
+            background: #0d3594; color: white; border: none; border-radius: 8px;
+            font-weight: bold; cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            font-size: 14px;
+          }
+          #ripper-btn:hover { background: #082260; transform: translateY(-1px); }
+          #ripper-btn:disabled { background: #666; cursor: not-allowed; transform: none; }
+          #ripper-log {
+            background: rgba(0,0,0,0.8); color: #fff; padding: 8px;
+            border-radius: 4px; font-size: 11px; max-width: 200px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            display: none;
+          }
+        `;
+        document.head.appendChild(style);
+      };
+     
+      // --- Helper: Canvas Copy (Bypasses Blob URL protection) ---
+      function copyImageToBlob(img) {
+          return new Promise((resolve) => {
+              if (!img.complete || img.naturalWidth === 0) {
+                  resolve(null);
+                  return;
+              }
+              try {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = img.naturalWidth;
+                  canvas.height = img.naturalHeight;
+                  const ctx = canvas.getContext('2d');
+                  ctx.drawImage(img, 0, 0);
+                  canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.95);
+              } catch (e) {
+                  console.error("Canvas capture failed:", e);
+                  resolve(null);
+              }
+          });
+      }
+     
+      // --- Core Logic ---
+     
+      async function scanVisiblePages() {
+          const images = document.querySelectorAll(CONFIG.IMG_SELECTOR);
+          let added = 0;
+     
+          for (const img of images) {
+              // Identify page by alt tag (e.g., "page_8")
+              // If alt is missing, fallback to src (less reliable for sorting)
+              const id = img.alt || img.src;
+              
+              if (!state.captured.has(id)) {
+                  const blob = await copyImageToBlob(img);
+                  if (blob) {
+                      // Save page number for sorting
+                      const pageNumMatch = (img.alt || "").match(/page_(\d+)/);
+                      const pageNum = pageNumMatch ? parseInt(pageNumMatch[1], 10) : 9999;
+                      
+                      state.captured.set(id, { blob, pageNum, id });
+                      added++;
+                  }
+              }
+          }
+          return added;
+      }
+     
+      // Simulate "ArrowLeft" to go to next page (Manga is Right-to-Left)
+      function triggerNextPage() {
+          // 1. Try Keyboard Event
+          const kEvent = new KeyboardEvent('keydown', {
+              key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37,
+              which: 37, bubbles: true, cancelable: true
+          });
+          document.dispatchEvent(kEvent);
+          
+          // 2. Try clicking the left side of the screen (Fallback)
+          const clickEvent = new MouseEvent('click', {
+              view: window, bubbles: true, cancelable: true,
+              clientX: window.innerWidth * 0.1, // 10% from left
+              clientY: window.innerHeight / 2
+          });
+          const target = document.elementFromPoint(window.innerWidth * 0.1, window.innerHeight / 2);
+          if (target) target.dispatchEvent(clickEvent);
+      }
+     
+      async function startRipper(btn, log) {
+          if (state.isRunning) return;
+          state.isRunning = true;
+          state.captured.clear();
+          
+          btn.disabled = true;
+          log.style.display = 'block';
+          log.innerText = "Initializing...";
+     
+          // Reset to beginning (Try ArrowRight a few times just in case)
+          for(let i=0; i<3; i++) {
+              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+              await new Promise(r => setTimeout(r, 200));
+          }
+     
+          let noNewPageCount = 0;
+          
+          // Main Loop
+          while (true) {
+              const foundNew = await scanVisiblePages();
+              
+              // Update Status
+              const count = state.captured.size;
+              btn.innerText = `Scanning... (${count})`;
+              
+              if (foundNew > 0) {
+                  noNewPageCount = 0;
+                  log.innerText = `Captured: ${foundNew} new page(s)`;
+              } else {
+                  noNewPageCount++;
+                  log.innerText = `Turning page... (Attempt ${noNewPageCount}/${CONFIG.MAX_RETRIES})`;
+              }
+     
+              // Stop condition
+              if (noNewPageCount >= CONFIG.MAX_RETRIES) {
+                  // Double check: if we have 0 pages, something is wrong.
+                  if (count === 0) {
+                      alert("Could not capture any pages. \n\nPlease try manually clicking through the chapter while this script is running.");
+                      break; 
+                  }
+                  break; // Finished
+              }
+     
+              // Navigate
+              triggerNextPage();
+              
+              // Wait for load
+              await new Promise(r => setTimeout(r, CONFIG.WAIT_TIME));
+          }
+     
+          finishRipper(btn, log);
+      }
+     
+      async function finishRipper(btn, log) {
+          const pages = Array.from(state.captured.values());
+          
+          if (pages.length === 0) {
+              state.isRunning = false;
+              btn.disabled = false;
+              btn.innerText = "Start Rip";
+              return;
+          }
+     
+          btn.innerText = "Zipping...";
+          log.innerText = "Generating ZIP file...";
+     
+          // Sort by Page Number (page_1, page_2...)
+          pages.sort((a, b) => a.pageNum - b.pageNum);
+     
+          const zip = new JSZip();
+          pages.forEach((p, i) => {
+              // Use padding 001, 002...
+              const fileName = `${String(p.pageNum).padStart(3, '0')}.jpg`;
+              zip.file(fileName, p.blob);
+          });
+     
+          // Filename
+          const title = document.title.split('-')[0].trim() || "Manga";
+          const chMatch = document.title.match(/chapter\s*([\d.]+)/i);
+          const ch = chMatch ? chMatch[1] : "Collection";
+          
+          try {
+              const content = await zip.generateAsync({ type: "blob" });
+              saveAs(content, `${title} - Ch ${ch}.zip`);
+              
+              btn.innerText = "Done!";
+              btn.style.background = "#28a745";
+              log.innerText = `Saved ${pages.length} pages.`;
+          } catch (e) {
+              btn.innerText = "Error";
+              alert("Zip Error: " + e);
+          }
+     
+          // Reset UI after delay
+          setTimeout(() => {
+              state.isRunning = false;
+              btn.disabled = false;
+              btn.innerText = "Start Rip";
+              btn.style.background = "#0d3594";
+          }, 4000);
+      }
+     
+      // --- Init ---
+      function createUI() {
+          if (document.getElementById('mangaup-ui')) return;
+          
+          const div = document.createElement('div');
+          div.id = 'mangaup-ui';
+          
+          const log = document.createElement('div');
+          log.id = 'ripper-log';
+          
+          const btn = document.createElement('button');
+          btn.id = 'ripper-btn';
+          btn.innerText = "Start Rip";
+          btn.onclick = () => startRipper(btn, log);
+          
+          div.appendChild(log);
+          div.appendChild(btn);
+          document.body.appendChild(div);
+      }
+     
+      injectStyles();
+      
+      // Wait for the specific image class to appear in DOM
+      const observer = new MutationObserver(() => {
+          if (document.querySelector(CONFIG.IMG_SELECTOR)) {
+              createUI();
+          }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+     
+      // Fallback if mutation observer misses (sometimes happens with iframes/shadows)
+      setTimeout(createUI, 3000);
+     
+    })();
+
